@@ -33,6 +33,7 @@ from __future__ import absolute_import
 from .wiener import deltaW, Ikpw, Iwik, Jkpw, Jwik
 import numpy as np
 import numbers
+import numba
 
 
 class Error(Exception):
@@ -115,7 +116,7 @@ def _check_args(f, G, y0, tspan, dW=None, IJ=None):
     return (d, m, f, G, y0, tspan, dW, IJ)
 
 
-def itoint(f, G, y0, tspan):
+def itoint(f, G, y0, tspan, use_jit=False):
     """ Numerically integrate the Ito equation  dy = f(y,t)dt + G(y,t)dW
 
     where y is the d-dimensional state vector, f is a vector-valued function,
@@ -131,6 +132,11 @@ def itoint(f, G, y0, tspan):
       tspan (array): The sequence of time points for which to solve for y.
         These must be equally spaced, e.g. np.arange(0,10,0.005)
         tspan[0] is the intial time corresponding to the initial state y0.
+      use_jit: boolean to indicate whether a just-in-time compiled version
+        of the integration routine should be used (experimental). Note that
+        in this case, both f and G need to be defined as jit function as well,
+        e.g. by decorating them with @numba.jit(nopython=True). Also, G must be
+        single function and may no longer be a list of functions.
 
     Returns:
       y: array, with shape (len(tspan), len(y0))
@@ -143,7 +149,7 @@ def itoint(f, G, y0, tspan):
     # Ito algorithm based on properties of the system and noise.
     (d, m, f, G, y0, tspan, __, __) = _check_args(f, G, y0, tspan, None, None)
     chosenAlgorithm = itoSRI2
-    return chosenAlgorithm(f, G, y0, tspan)
+    return chosenAlgorithm(f, G, y0, tspan, use_jit=use_jit)
 
 
 def stratint(f, G, y0, tspan):
@@ -217,7 +223,7 @@ def itoEuler(f, G, y0, tspan, dW=None):
     if dW is None:
         # pre-generate Wiener increments (for m independent Wiener processes):
         dW = deltaW(N - 1, m, h)
-    y[0] = y0;
+    y[0] = y0
     for n in range(0, N-1):
         tn = tspan[n]
         yn = y[n]
@@ -270,7 +276,7 @@ def stratHeun(f, G, y0, tspan, dW=None):
     if dW is None:
         # pre-generate Wiener increments (for m independent Wiener processes):
         dW = deltaW(N - 1, m, h)
-    y[0] = y0;
+    y[0] = y0
     for n in range(0, N-1):
         tn = tspan[n]
         tnp1 = tspan[n+1]
@@ -285,7 +291,7 @@ def stratHeun(f, G, y0, tspan, dW=None):
     return y
 
 
-def itoSRI2(f, G, y0, tspan, Imethod=Ikpw, dW=None, I=None):
+def itoSRI2(f, G, y0, tspan, Imethod=Ikpw, dW=None, I=None, use_jit=False):
     """Use the Roessler2010 order 1.0 strong Stochastic Runge-Kutta algorithm
     SRI2 to integrate an Ito equation dy = f(y,t)dt + G(y,t)dW(t)
 
@@ -332,6 +338,12 @@ def itoSRI2(f, G, y0, tspan, Imethod=Ikpw, dW=None, I=None):
         use a specific realization of the d independent Wiener processes and
         their multiple integrals at each time step. If not provided, suitable
         values will be generated randomly.
+
+      use_jit: boolean to indicate whether a just-in-time compiled version
+        of the integration routine should be used (experimental). Note that
+        in this case, both f and G need to be defined as jit function as well,
+        e.g. by decorating them with @numba.jit(nopython=True). Also, G must be
+        single function and may no longer be a list of functions.
       
     Returns:
       y: array, with shape (len(tspan), len(y0))
@@ -344,7 +356,10 @@ def itoSRI2(f, G, y0, tspan, Imethod=Ikpw, dW=None, I=None):
       A. Roessler (2010) Runge-Kutta Methods for the Strong Approximation of
         Solutions of Stochastic Differential Equations
     """
-    return _Roessler2010_SRK2(f, G, y0, tspan, Imethod, dW, I)
+    if use_jit:
+        return _Roessler2010_SRK2_numba(f, G, y0, tspan, Imethod, dW, I)
+    else:
+        return _Roessler2010_SRK2(f, G, y0, tspan, Imethod, dW, I)
 
 
 def stratSRS2(f, G, y0, tspan, Jmethod=Jkpw, dW=None, J=None):
@@ -460,7 +475,7 @@ def _Roessler2010_SRK2(f, G, y0, tspan, IJmethod, dW=None, IJ=None):
         I = IJ
     # allocate space for result
     y = np.zeros((N, d), dtype=type(y0[0]))
-    y[0] = y0;
+    y[0] = y0
     Gn = np.zeros((d, m), dtype=y.dtype)
     for n in range(0, N-1):
         tn = tspan[n]
@@ -490,6 +505,90 @@ def _Roessler2010_SRK2(f, G, y0, tspan, IJmethod, dW=None, IJ=None):
         else:
             for k in range(0, m):
                 Yn1 += 0.5*sqrth*(G(H2[:,k], tn1)[:,k] - G(H3[:,k], tn1)[:,k])
+        y[n+1] = Yn1
+    return y
+
+def _Roessler2010_SRK2_numba(f, G, y0, tspan, IJmethod, dW=None, IJ=None):
+    """Implements the Roessler2010 order 1.0 strong Stochastic Runge-Kutta
+    algorithms SRI2 (for Ito equations) and SRS2 (for Stratonovich equations)
+    using a just-in-time compiled integration routine.
+
+    Algorithms SRI2 and SRS2 are almost identical and have the same extended
+    Butcher tableaus. The difference is that Ito repeateded integrals I_ij are
+    replaced by Stratonovich repeated integrals J_ij when integrating a
+    Stratonovich equation (Theorem 6.2 in Roessler2010).
+
+    Args:
+      f: A function f(y, t) returning an array of shape (d,)
+      G: Either a function G(y, t) that returns an array of shape (d, m),
+         or a list of m functions g(y, t) each returning an array shape (d,).
+      y0: array of shape (d,) giving the initial state
+      tspan (array): Sequence of equally spaced time points
+      IJmethod (callable): which function to use to generate repeated
+        integrals. N.B. for an Ito equation, must use an Ito version here
+        (either Ikpw or Iwik). For a Stratonovich equation, must use a
+        Stratonovich version here (Jkpw or Jwik).
+      dW: optional array of shape (len(tspan)-1, d).
+      IJ: optional array of shape (len(tspan)-1, m, m).
+        Optional arguments dW and IJ are for advanced use, if you want to
+        use a specific realization of the d independent Wiener processes and
+        their multiple integrals at each time step. If not provided, suitable
+        values will be generated randomly.
+
+    Returns:
+      y: array, with shape (len(tspan), len(y0))
+
+    Raises:
+      SDEValueError
+
+    See also:
+      A. Roessler (2010) Runge-Kutta Methods for the Strong Approximation of
+        Solutions of Stochastic Differential Equations
+    """
+    (d, m, f, G, y0, tspan, dW, IJ) = _check_args(f, G, y0, tspan, dW, IJ)
+    if not callable(G):
+        raise ValueError("The jitted version of the integration function does not accept a list of functions for G.")
+    N = len(tspan)
+    h = (tspan[N-1] - tspan[0])/(N - 1) # assuming equal time steps
+    if dW is None:
+        # pre-generate Wiener increments (for m independent Wiener processes):
+        dW = deltaW(N - 1, m, h) # shape (N, m)
+    if IJ is None:
+        # pre-generate repeated stochastic integrals for each time step.
+        # Must give I_ij for the Ito case or J_ij for the Stratonovich case:
+        __, I = IJmethod(dW, h) # shape (N, m, m)
+    else:
+        I = IJ
+
+    return _Roessler2010_SRK2_numba_inner(d, m, f, G, y0, tspan, dW, I)
+
+@numba.jit(nopython=True)
+def _Roessler2010_SRK2_numba_inner(d, m, f, G, y0, tspan, dW, I):
+    """Just-in-time compiled version of the integration routine.
+    """
+    N = len(tspan)
+    # allocate space for result
+    y = np.zeros((N, d), dtype=type(y0[0]))
+    y[0] = y0
+    for n in range(0, N-1):
+        tn = tspan[n]
+        tn1 = tspan[n+1]
+        h = tn1 - tn
+        sqrth = np.sqrt(h)
+        Yn = y[n] # shape (d,)
+        Ik = dW[n,:] # shape (m,)
+        Iij = I[n,:,:] # shape (m, m)
+        fnh = f(Yn, tn)*h # shape (d,)
+        Gn = G(Yn, tn)
+        sum1 = np.dot(Gn, Iij)/sqrth # shape (d, m)
+        H20 = Yn + fnh # shape (d,)
+        H20b = np.reshape(H20, (d, 1))
+        H2 = H20b + sum1 # shape (d, m)
+        H3 = H20b - sum1
+        fn1h = f(H20, tn1)*h
+        Yn1 = Yn + 0.5*(fnh + fn1h) + np.dot(Gn, Ik)
+        for k in range(0, m):
+            Yn1 += 0.5*sqrth*(G(H2[:,k], tn1)[:,k] - G(H3[:,k], tn1)[:,k])
         y[n+1] = Yn1
     return y
 
@@ -576,7 +675,7 @@ def stratKP2iS(f, G, y0, tspan, Jmethod=Jkpw, gam=None, al1=None, al2=None,
                 gam*Vnm1 - Ynp1)
     fn = None
     Vn = None
-    y[0] = y0;
+    y[0] = y0
     for n in range(0, N-1):
         tn = tspan[n]
         tnp1 = tspan[n+1]

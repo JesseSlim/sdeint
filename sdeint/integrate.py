@@ -562,7 +562,7 @@ def _Roessler2010_SRK2_numba(f, G, y0, tspan, IJmethod, dW=None, IJ=None):
 
     return _Roessler2010_SRK2_numba_inner(d, m, f, G, y0, tspan, dW, I)
 
-@numba.jit(nopython=True)
+@numba.jit(nopython=True, nogil=True)
 def _Roessler2010_SRK2_numba_inner(d, m, f, G, y0, tspan, dW, I):
     """Just-in-time compiled version of the integration routine.
     """
